@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
 
 # ============================================================================
-# AWS SSO Login - Bash Native Implementation
+# AWS SSO Login - Bash Native Implementation (Enhanced)
 # ============================================================================
-# Uses only AWS CLI - no additional dependencies required
-#
-# Usage:
-#   eval "$(~/bin/aws-sso/aws-sso)"
-#
-# Or add this alias to your .zshrc/.bashrc:
-#   alias aws-sso='eval "$(~/bin/aws-sso/aws-sso)"'
-#
-# Then just run: aws-sso
+# Features:
+# - Auto-refresh of OIDC tokens
+# - 'switch' command to change accounts quickly
+# - Persistent Client Registration
 # ============================================================================
 
 set -euo pipefail
@@ -23,93 +18,114 @@ SSO_START_URL='https://your-sso-url.awsapps.com/start'
 SSO_REGION='us-east-1'
 SSO_ISSUER_URL='https://identitycenter.amazonaws.com/your-sso-issuer-id'
 LOG_FILE="${0%/*}/aws-sso.log"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+SHARED_TOKEN_FILE="${HOME}/.aws/sso-shared-token.json"
 # ============================================================================
 
 # Clear log file
 : > "$LOG_FILE"
 
-# Logging function (to file only)
-log() {
-  echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" >> "$LOG_FILE"
-}
+log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" >> "$LOG_FILE"; }
+status() { echo "$*" >&2; }
+die() { status "❌ Error: $*"; status "   See $LOG_FILE for details"; exit 1; }
+escape_single_quotes() { echo "${1//\'/\'\\\'\'}"; }
 
-# Status messages (to stderr so they don't interfere with eval output)
-status() {
-  echo "$*" >&2
-}
-
-# Error handler
-die() {
-  status "❌ Error: $*"
-  status "   See $LOG_FILE for details"
-  exit 1
-}
-
-# Escape single quotes for shell output
-escape_single_quotes() {
-  echo "${1//\'/\'\\\'\'}"
-}
-
-# Open URL in browser (cross-platform)
 open_url() {
   local url="$1"
-  if command -v open &>/dev/null; then
-    open "$url"
-  elif command -v xdg-open &>/dev/null; then
-    xdg-open "$url"
-  elif command -v wslview &>/dev/null; then
-    wslview "$url"
-  else
-    status "   Please open this URL manually: $url"
-  fi
+  if command -v open &>/dev/null; then open "$url"
+  elif command -v xdg-open &>/dev/null; then xdg-open "$url"
+  elif command -v wslview &>/dev/null; then wslview "$url"
+  else status "   Please open this URL manually: $url"; fi
 }
 
-# Register OIDC client
-register_client() {
-  log "Registering client..."
+# ----------------------------------------------------------------------------
+# SHARED TOKEN PERSISTENCE (cross-terminal)
+# ----------------------------------------------------------------------------
+
+read_shared_tokens() {
+  [[ -f "$SHARED_TOKEN_FILE" ]] || return 1
+  local content
+  content=$(cat "$SHARED_TOKEN_FILE" 2>/dev/null) || return 1
   
+  SHARED_ACCESS_TOKEN=$(echo "$content" | grep -o '"accessToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+  SHARED_REFRESH_TOKEN=$(echo "$content" | grep -o '"refreshToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+  SHARED_CLIENT_ID=$(echo "$content" | grep -o '"clientId"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+  SHARED_CLIENT_SECRET=$(echo "$content" | grep -o '"clientSecret"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+  SHARED_EXPIRES_AT=$(echo "$content" | grep -o '"expiresAt"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+  
+  [[ -n "$SHARED_ACCESS_TOKEN" && -n "$SHARED_REFRESH_TOKEN" ]] || return 1
+  return 0
+}
+
+write_shared_tokens() {
+  local access_token="${1:-}"
+  local refresh_token="${2:-}"
+  local client_id="${3:-}"
+  local client_secret="${4:-}"
+  local expires_at="${5:-}"
+  
+  [[ -n "$access_token" && -n "$refresh_token" && -n "$client_id" && -n "$client_secret" ]] || return 1
+  
+  mkdir -p "$(dirname "$SHARED_TOKEN_FILE")" 2>/dev/null || true
+  
+  cat > "$SHARED_TOKEN_FILE" << EOF
+{
+  "accessToken": "${access_token}",
+  "refreshToken": "${refresh_token}",
+  "clientId": "${client_id}",
+  "clientSecret": "${client_secret}",
+  "expiresAt": ${expires_at:-0}
+}
+EOF
+  chmod 600 "$SHARED_TOKEN_FILE" 2>/dev/null
+  log "Shared tokens written to $SHARED_TOKEN_FILE"
+}
+
+# ----------------------------------------------------------------------------
+# AUTHENTICATION LOGIC
+# ----------------------------------------------------------------------------
+
+register_client() {
+  # If we already have client details in env, reuse them
+  if [[ -n "${_AWS_SSO_CLIENT_ID:-}" && -n "${_AWS_SSO_CLIENT_SECRET:-}" ]]; then
+    CLIENT_ID="${_AWS_SSO_CLIENT_ID}"
+    CLIENT_SECRET="${_AWS_SSO_CLIENT_SECRET}"
+    log "Using existing client registration: $CLIENT_ID"
+    return
+  fi
+
+  log "Registering new client..."
   local response
   response=$(aws sso-oidc register-client \
-    --client-name "SSOCLISwitcher" \
-    --client-type "public" \
+    --client-name "SSOCLISwitcher" --client-type "public" \
     --scopes "sso:account:access" \
-    --grant-types "urn:ietf:params:oauth:grant-type:device_code" \
-    --issuer-url "$SSO_ISSUER_URL" \
-    --region "$SSO_REGION" \
+    --grant-types "urn:ietf:params:oauth:grant-type:device_code" "refresh_token" \
+    --issuer-url "$SSO_ISSUER_URL" --region "$SSO_REGION" \
     --output json 2>>"$LOG_FILE") || die "Failed to register client"
   
   CLIENT_ID=$(echo "$response" | grep -o '"clientId"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
   CLIENT_SECRET=$(echo "$response" | grep -o '"clientSecret"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
   
-  [[ -n "$CLIENT_ID" && -n "$CLIENT_SECRET" ]] || die "Failed to parse client registration response"
-  log "Client registered: $CLIENT_ID"
+  [[ -n "$CLIENT_ID" ]] || die "Failed to parse client registration"
 }
 
-# Start device authorization
 start_device_authorization() {
   log "Starting device authorization..."
-  
   local response
   response=$(aws sso-oidc start-device-authorization \
-    --client-id "$CLIENT_ID" \
-    --client-secret "$CLIENT_SECRET" \
-    --start-url "$SSO_START_URL" \
-    --region "$SSO_REGION" \
+    --client-id "$CLIENT_ID" --client-secret "$CLIENT_SECRET" \
+    --start-url "$SSO_START_URL" --region "$SSO_REGION" \
     --output json 2>>"$LOG_FILE") || die "Failed to start device authorization"
   
   DEVICE_CODE=$(echo "$response" | grep -o '"deviceCode"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
   USER_CODE=$(echo "$response" | grep -o '"userCode"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-  VERIFICATION_URI=$(echo "$response" | grep -o '"verificationUri"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
   VERIFICATION_URI_COMPLETE=$(echo "$response" | grep -o '"verificationUriComplete"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
   POLL_INTERVAL=$(echo "$response" | grep -o '"interval"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
   
-  [[ -n "$DEVICE_CODE" ]] || die "Failed to parse device authorization response"
+  [[ -n "$DEVICE_CODE" ]] || die "Failed to parse device authorization"
   POLL_INTERVAL=${POLL_INTERVAL:-5}
-  
-  log "Device authorization started, code: $USER_CODE"
 }
 
-# Poll for access token
 poll_for_token() {
   local max_attempts=60
   local attempts=0
@@ -119,265 +135,225 @@ poll_for_token() {
     local exit_code=0
     
     response=$(aws sso-oidc create-token \
-      --client-id "$CLIENT_ID" \
-      --client-secret "$CLIENT_SECRET" \
+      --client-id "$CLIENT_ID" --client-secret "$CLIENT_SECRET" \
       --grant-type "urn:ietf:params:oauth:grant-type:device_code" \
-      --device-code "$DEVICE_CODE" \
-      --region "$SSO_REGION" \
+      --device-code "$DEVICE_CODE" --region "$SSO_REGION" \
       --output json 2>&1) || exit_code=$?
 
-    log "Poll for token response: $response"
-    
     if [[ $exit_code -eq 0 ]]; then
       ACCESS_TOKEN=$(echo "$response" | grep -o '"accessToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+      REFRESH_TOKEN=$(echo "$response" | grep -o '"refreshToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
       [[ -n "$ACCESS_TOKEN" ]] && return 0
     fi
     
     if echo "$response" | grep -qi "AuthorizationPendingException\|authorization_pending"; then
-      sleep "$POLL_INTERVAL"
-      ((attempts++))
+      sleep "$POLL_INTERVAL"; ((attempts++))
     elif echo "$response" | grep -qi "SlowDownException\|slow_down"; then
-      sleep $((POLL_INTERVAL + 5))
-      ((attempts++))
+      sleep $((POLL_INTERVAL + 5)); ((attempts++))
     else
       log "Token polling error: $response"
       die "Authentication failed"
     fi
   done
-  
   die "Authentication timed out"
 }
 
-# List accounts and return as array
+try_refresh_oidc_token() {
+  log "Attempting to refresh OIDC token..."
+  local response
+  local exit_code=0
+  
+  response=$(aws sso-oidc create-token \
+    --client-id "$CLIENT_ID" --client-secret "$CLIENT_SECRET" \
+    --grant-type "refresh_token" \
+    --refresh-token "$_AWS_SSO_REFRESH_TOKEN" \
+    --region "$SSO_REGION" \
+    --output json 2>&1) || exit_code=$?
+
+  if [[ $exit_code -eq 0 ]]; then
+    ACCESS_TOKEN=$(echo "$response" | grep -o '"accessToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+    REFRESH_TOKEN=$(echo "$response" | grep -o '"refreshToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+    if [[ -z "$REFRESH_TOKEN" ]]; then
+        # Sometimes AWS doesn't rotate the refresh token; keep the old one
+        REFRESH_TOKEN="$_AWS_SSO_REFRESH_TOKEN"
+    fi
+    log "OIDC Token refreshed successfully."
+    return 0
+  fi
+  
+  log "Failed to refresh OIDC token: $response"
+  return 1
+}
+
+# ----------------------------------------------------------------------------
+# ACCOUNT & ROLE LOGIC
+# ----------------------------------------------------------------------------
+
 list_accounts() {
   log "Listing accounts..."
-  
-  ACCOUNT_IDS=()
-  ACCOUNT_NAMES=()
-  
-  local response
-  local next_token=""
+  ACCOUNT_IDS=(); ACCOUNT_NAMES=()
+  local response; local next_token=""
   
   while true; do
-    local cmd_args=(
-      --access-token "$ACCESS_TOKEN"
-      --region "$SSO_REGION"
-      --output json
-    )
+    local cmd_args=(--access-token "$ACCESS_TOKEN" --region "$SSO_REGION" --output json)
     [[ -n "$next_token" ]] && cmd_args+=(--next-token "$next_token")
     
-    response=$(aws sso list-accounts "${cmd_args[@]}" 2>>"$LOG_FILE") || die "Failed to list accounts"
-    log "list-accounts response: $response"
+    response=$(aws sso list-accounts "${cmd_args[@]}" 2>>"$LOG_FILE") || return 1
     
-    # Parse accounts directly from response (line by line)
     local current_id=""
     local current_name=""
     
     while IFS= read -r line; do
-      if [[ "$line" =~ \"accountId\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
-        current_id="${BASH_REMATCH[1]}"
-      fi
-      if [[ "$line" =~ \"accountName\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
-        current_name="${BASH_REMATCH[1]}"
-      fi
-      # When we have both, add to arrays and reset
+      if [[ "$line" =~ \"accountId\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then current_id="${BASH_REMATCH[1]}"; fi
+      if [[ "$line" =~ \"accountName\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then current_name="${BASH_REMATCH[1]}"; fi
       if [[ -n "$current_id" && -n "$current_name" ]]; then
-        ACCOUNT_IDS+=("$current_id")
-        ACCOUNT_NAMES+=("$current_name")
-        current_id=""
-        current_name=""
+        ACCOUNT_IDS+=("$current_id"); ACCOUNT_NAMES+=("$current_name")
+        current_id=""; current_name=""
       fi
     done <<< "$response"
     
-    # Check for next token
     next_token=$(echo "$response" | grep -o '"nextToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4) || true
     [[ -z "$next_token" ]] && break
   done
   
-  # Sort accounts alphabetically by name
+  # Sort accounts
   if [[ ${#ACCOUNT_IDS[@]} -gt 1 ]]; then
     local combined=()
-    for i in "${!ACCOUNT_IDS[@]}"; do
-      combined+=("${ACCOUNT_NAMES[$i]}|${ACCOUNT_IDS[$i]}")
-    done
-    
-    ACCOUNT_NAMES=()
-    ACCOUNT_IDS=()
-    while IFS='|' read -r name id; do
-      ACCOUNT_NAMES+=("$name")
-      ACCOUNT_IDS+=("$id")
-    done < <(printf '%s\n' "${combined[@]}" | sort -f)
+    for i in "${!ACCOUNT_IDS[@]}"; do combined+=("${ACCOUNT_NAMES[$i]}|${ACCOUNT_IDS[$i]}"); done
+    ACCOUNT_NAMES=(); ACCOUNT_IDS=()
+    while IFS='|' read -r name id; do ACCOUNT_NAMES+=("$name"); ACCOUNT_IDS+=("$id"); done < <(printf '%s\n' "${combined[@]}" | sort -f)
   fi
-  
-  log "Found ${#ACCOUNT_IDS[@]} accounts"
 }
 
-# List roles for an account
 list_account_roles() {
   local account_id="$1"
   log "Listing roles for account $account_id..."
-  
-  ROLE_NAMES=()
-  
-  local response
-  local next_token=""
+  ROLE_NAMES=(); local response; local next_token=""
   
   while true; do
-    local cmd_args=(
-      --access-token "$ACCESS_TOKEN"
-      --account-id "$account_id"
-      --region "$SSO_REGION"
-      --output json
-    )
+    local cmd_args=(--access-token "$ACCESS_TOKEN" --account-id "$account_id" --region "$SSO_REGION" --output json)
     [[ -n "$next_token" ]] && cmd_args+=(--next-token "$next_token")
     
     response=$(aws sso list-account-roles "${cmd_args[@]}" 2>>"$LOG_FILE") || die "Failed to list roles"
-    log "list-account-roles response: $response"
     
-    # Parse roles directly from response
     while IFS= read -r line; do
-      if [[ "$line" =~ \"roleName\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
-        ROLE_NAMES+=("${BASH_REMATCH[1]}")
-      fi
+      if [[ "$line" =~ \"roleName\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then ROLE_NAMES+=("${BASH_REMATCH[1]}"); fi
     done <<< "$response"
     
     next_token=$(echo "$response" | grep -o '"nextToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4) || true
     [[ -z "$next_token" ]] && break
   done
-  
-  log "Found ${#ROLE_NAMES[@]} roles"
 }
 
-# Get role credentials
 get_role_credentials() {
   local account_id="$1"
   local role_name="$2"
-  log "Getting credentials for $role_name in $account_id..."
+  log "Getting credentials for $role_name..."
   
   local response
   response=$(aws sso get-role-credentials \
-    --access-token "$ACCESS_TOKEN" \
-    --account-id "$account_id" \
-    --role-name "$role_name" \
-    --region "$SSO_REGION" \
-    --output json 2>>"$LOG_FILE") || die "Failed to get role credentials"
+    --access-token "$ACCESS_TOKEN" --account-id "$account_id" --role-name "$role_name" \
+    --region "$SSO_REGION" --output json 2>>"$LOG_FILE") || die "Failed to get role credentials"
   
   CRED_ACCESS_KEY=$(echo "$response" | grep -o '"accessKeyId"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
   CRED_SECRET_KEY=$(echo "$response" | grep -o '"secretAccessKey"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
   CRED_SESSION_TOKEN=$(echo "$response" | grep -o '"sessionToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
   CRED_EXPIRATION=$(echo "$response" | grep -o '"expiration"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
-  
-  [[ -n "$CRED_ACCESS_KEY" && -n "$CRED_SECRET_KEY" && -n "$CRED_SESSION_TOKEN" ]] || \
-    die "Failed to parse credentials"
-  
-  log "Credentials obtained, expires: $CRED_EXPIRATION"
 }
 
-# Interactive selection menu
 select_option() {
-  local prompt="$1"
-  shift
-  local options=("$@")
-  local num_options=${#options[@]}
-  
-  status ""
-  status "$prompt"
-  status ""
-  
+  local prompt="$1"; shift; local options=("$@"); local num_options=${#options[@]}
+  status ""; status "$prompt"; status ""
   local i=1
-  for opt in "${options[@]}"; do
-    status "  $i) $opt"
-    ((i++))
-  done
-  
+  for opt in "${options[@]}"; do status "  $i) $opt"; ((i++)); done
   status ""
-  
   while true; do
     read -r -p "Enter selection (1-$num_options): " selection </dev/tty
     if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le "$num_options" ]]; then
-      SELECTED_INDEX=$((selection - 1))
-      return 0
+      SELECTED_INDEX=$((selection - 1)); return 0
     fi
-    status "Invalid selection. Please enter a number between 1 and $num_options."
+    status "Invalid selection."
   done
 }
 
-# Output shell commands for credentials
+# ----------------------------------------------------------------------------
+# OUTPUT GENERATION
+# ----------------------------------------------------------------------------
+
 output_shell_commands() {
   local account_name="$1"
   local role_name="$2"
   local account_id="$3"
   
-  local escaped_account_name escaped_role_name escaped_access_key escaped_secret_key escaped_session_token escaped_access_token escaped_account_id
-  escaped_account_name=$(escape_single_quotes "$account_name")
-  escaped_role_name=$(escape_single_quotes "$role_name")
-  escaped_access_key=$(escape_single_quotes "$CRED_ACCESS_KEY")
-  escaped_secret_key=$(escape_single_quotes "$CRED_SECRET_KEY")
-  escaped_session_token=$(escape_single_quotes "$CRED_SESSION_TOKEN")
-  escaped_access_token=$(escape_single_quotes "$ACCESS_TOKEN")
-  escaped_account_id=$(escape_single_quotes "$account_id")
+  local esc_acc_name=$(escape_single_quotes "$account_name")
+  local esc_role_name=$(escape_single_quotes "$role_name")
   
   cat << EOF
 # AWS SSO Credentials for ${role_name}@${account_name}
-export AWS_ACCESS_KEY_ID='${escaped_access_key}'
-export AWS_SECRET_ACCESS_KEY='${escaped_secret_key}'
-export AWS_SESSION_TOKEN='${escaped_session_token}'
-export AWS_SSO_ACCOUNT_NAME='${escaped_account_name}'
-export AWS_SSO_ROLE_NAME='${escaped_role_name}'
+export AWS_ACCESS_KEY_ID='${CRED_ACCESS_KEY}'
+export AWS_SECRET_ACCESS_KEY='${CRED_SECRET_KEY}'
+export AWS_SESSION_TOKEN='${CRED_SESSION_TOKEN}'
+export AWS_SSO_ACCOUNT_NAME='${esc_acc_name}'
+export AWS_SSO_ROLE_NAME='${esc_role_name}'
 export AWS_SSO_EXPIRATION='${CRED_EXPIRATION}'
-export _AWS_SSO_ACCESS_TOKEN='${escaped_access_token}'
-export _AWS_SSO_ACCOUNT_ID='${escaped_account_id}'
+export _AWS_SSO_ACCESS_TOKEN='${ACCESS_TOKEN}'
+export _AWS_SSO_REFRESH_TOKEN='${REFRESH_TOKEN}'
+export _AWS_SSO_ACCOUNT_ID='${account_id}'
 export _AWS_SSO_REGION='${SSO_REGION}'
+export _AWS_SSO_CLIENT_ID='${CLIENT_ID}'
+export _AWS_SSO_CLIENT_SECRET='${CLIENT_SECRET}'
 
 # Save original prompt if not already saved
-if [ -z "\${_AWS_SSO_ORIGINAL_PROMPT:-}" ]; then
-  export _AWS_SSO_ORIGINAL_PROMPT="\$PROMPT"
-fi
+if [ -z "\${_AWS_SSO_ORIGINAL_PROMPT:-}" ]; then export _AWS_SSO_ORIGINAL_PROMPT="\$PROMPT"; fi
 
-# Define precmd hook to maintain AWS prompt across terminal resets
 _aws_sso_precmd() {
-  if [[ -n "\${AWS_SSO_ROLE_NAME:-}" && -n "\${AWS_SSO_ACCOUNT_NAME:-}" ]]; then
+  if [[ -n "\${AWS_SSO_ROLE_NAME:-}" ]]; then
     PROMPT="%F{red}\${AWS_SSO_ROLE_NAME}%f@%F{green}\${AWS_SSO_ACCOUNT_NAME}%f %c %# "
   fi
 }
+if [[ ! " \${precmd_functions[*]:-} " =~ " _aws_sso_precmd " ]]; then precmd_functions+=(_aws_sso_precmd); fi
 
-# Add to precmd_functions if not already there
-if [[ ! " \${precmd_functions[*]:-} " =~ " _aws_sso_precmd " ]]; then
-  precmd_functions+=(_aws_sso_precmd)
-fi
-
-# Define function to check session TTL
-ttl() {
-  if [[ -z "\${AWS_SSO_EXPIRATION:-}" ]]; then
-    echo "No active session"
-    return 1
-  fi
-  
+_ttl() {
+  if [[ -z "\${AWS_SSO_EXPIRATION:-}" ]]; then echo "No active session"; return 1; fi
   local now_ms=\$(date +%s)000
   local remaining_ms=\$((\$AWS_SSO_EXPIRATION - now_ms))
-  
-  if [[ \$remaining_ms -le 0 ]]; then
-    echo "Expired"
-    return 1
-  fi
-  
-  local remaining_sec=\$((remaining_ms / 1000))
-  local hours=\$((remaining_sec / 3600))
-  local mins=\$(((remaining_sec % 3600) / 60))
-  local secs=\$((remaining_sec % 60))
-  
-  printf "%dh %dm %ds\\n" "\$hours" "\$mins" "\$secs"
+  if [[ \$remaining_ms -le 0 ]]; then echo "Expired"; return 1; fi
+  printf "%dh %dm %ds\\n" \$((remaining_ms / 3600000)) \$(((remaining_ms / 60000) % 60)) \$(((remaining_ms / 1000) % 60))
+}
+ttl() { _ttl; }
+
+_aws_sso_write_shared() {
+  local token_file="\${HOME}/.aws/sso-shared-token.json"
+  [[ -n "\$_AWS_SSO_ACCESS_TOKEN" && -n "\$_AWS_SSO_REFRESH_TOKEN" ]] || return 1
+  mkdir -p "\${token_file%/*}" 2>/dev/null || true
+  cat > "\$token_file" << TOKENEOF
+{
+  "accessToken": "\$_AWS_SSO_ACCESS_TOKEN",
+  "refreshToken": "\$_AWS_SSO_REFRESH_TOKEN",
+  "clientId": "\$_AWS_SSO_CLIENT_ID",
+  "clientSecret": "\$_AWS_SSO_CLIENT_SECRET",
+  "expiresAt": \${AWS_SSO_EXPIRATION:-0}
+}
+TOKENEOF
+  chmod 600 "\$token_file" 2>/dev/null
 }
 
-# Define refresh function to get new credentials without re-authenticating
+_aws_sso_write_shared
+
+# The Switch Command
+switch() {
+  echo "🔄 Switching accounts..."
+  # Re-run the script. It will detect the active OIDC token in the env and skip auth.
+  eval "\$('${SCRIPT_PATH}')"
+}
+
+# The Enhanced Refresh Command
 refresh() {
-  if [[ -z "\${_AWS_SSO_ACCESS_TOKEN:-}" || -z "\${_AWS_SSO_ACCOUNT_ID:-}" || -z "\${AWS_SSO_ROLE_NAME:-}" ]]; then
-    echo "❌ No active SSO session to refresh. Run aws-sso first."
-    return 1
-  fi
+  if [[ -z "\${_AWS_SSO_ACCESS_TOKEN:-}" ]]; then echo "❌ No SSO session."; return 1; fi
   
-  echo "🔄 Refreshing credentials for \${AWS_SSO_ROLE_NAME}@\${AWS_SSO_ACCOUNT_NAME}..."
+  echo "🔄 Refreshing credentials..."
   
+  # 1. Try to get role credentials
   local response
   response=\$(aws sso get-role-credentials \\
     --access-token "\$_AWS_SSO_ACCESS_TOKEN" \\
@@ -386,65 +362,74 @@ refresh() {
     --region "\${_AWS_SSO_REGION:-us-east-1}" \\
     --output json 2>&1)
   
-  local exit_code=\$?
-  
-  if [[ \$exit_code -ne 0 ]]; then
-    if echo "\$response" | grep -qi "UnauthorizedException\|ExpiredToken\|expired"; then
-      echo "❌ SSO access token has expired. Please run aws-sso again to re-authenticate."
-      return 1
-    fi
-    echo "❌ Failed to refresh credentials: \$response"
-    return 1
+  # 2. If Unauthorized/Expired, try to refresh the OIDC token
+  if [[ \$? -ne 0 ]]; then
+     if echo "\$response" | grep -qi "UnauthorizedException\|ExpiredToken\|expired"; then
+        echo "⚠️  SSO Token expired. Attempting OIDC refresh..."
+        
+        local oidc_resp
+        oidc_resp=\$(aws sso-oidc create-token \\
+          --client-id "\$_AWS_SSO_CLIENT_ID" --client-secret "\$_AWS_SSO_CLIENT_SECRET" \\
+          --grant-type "refresh_token" --refresh-token "\$_AWS_SSO_REFRESH_TOKEN" \\
+          --region "\$_AWS_SSO_REGION" --output json 2>&1)
+          
+        if [[ \$? -eq 0 ]]; then
+           # Update tokens in current shell
+           local new_at=\$(echo "\$oidc_resp" | grep -o '"accessToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+           local new_rt=\$(echo "\$oidc_resp" | grep -o '"refreshToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+            export _AWS_SSO_ACCESS_TOKEN="\$new_at"
+            [[ -n "\$new_rt" ]] && export _AWS_SSO_REFRESH_TOKEN="\$new_rt"
+            _aws_sso_write_shared
+            
+            echo "✅ OIDC Session Refreshed. Retrying role credential fetch..."
+           
+           # Retry get-role-credentials
+           response=\$(aws sso get-role-credentials \\
+             --access-token "\$_AWS_SSO_ACCESS_TOKEN" \\
+             --account-id "\$_AWS_SSO_ACCOUNT_ID" \\
+             --role-name "\$AWS_SSO_ROLE_NAME" \\
+             --region "\$_AWS_SSO_REGION" --output json 2>&1)
+        else
+           echo "❌ Failed to refresh OIDC token. Please run 'aws-sso' to re-login."
+           return 1
+        fi
+     else
+        echo "❌ AWS Error: \$response"
+        return 1
+     fi
   fi
   
-  # Parse new credentials
-  local new_access_key new_secret_key new_session_token new_expiration
-  new_access_key=\$(echo "\$response" | grep -o '"accessKeyId"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-  new_secret_key=\$(echo "\$response" | grep -o '"secretAccessKey"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-  new_session_token=\$(echo "\$response" | grep -o '"sessionToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-  new_expiration=\$(echo "\$response" | grep -o '"expiration"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*\$')
+  # Parse new credentials from response (either first try or retry)
+  local new_ak=\$(echo "\$response" | grep -o '"accessKeyId"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+  local new_sk=\$(echo "\$response" | grep -o '"secretAccessKey"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+  local new_st=\$(echo "\$response" | grep -o '"sessionToken"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+  local new_ex=\$(echo "\$response" | grep -o '"expiration"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*\$')
   
-  if [[ -z "\$new_access_key" || -z "\$new_secret_key" || -z "\$new_session_token" ]]; then
-    echo "❌ Failed to parse refreshed credentials"
+   if [[ -n "\$new_ak" ]]; then
+     export AWS_ACCESS_KEY_ID="\$new_ak"
+     export AWS_SECRET_ACCESS_KEY="\$new_sk"
+     export AWS_SESSION_TOKEN="\$new_st"
+     export AWS_SSO_EXPIRATION="\$new_ex"
+     _aws_sso_write_shared
+     echo "✅ Credentials refreshed! TTL: \$(ttl)"
+   else
+    echo "❌ Failed to parse credentials."
     return 1
   fi
-  
-  # Update environment
-  export AWS_ACCESS_KEY_ID="\$new_access_key"
-  export AWS_SECRET_ACCESS_KEY="\$new_secret_key"
-  export AWS_SESSION_TOKEN="\$new_session_token"
-  export AWS_SSO_EXPIRATION="\$new_expiration"
-  
-  echo "✅ Credentials refreshed for \${AWS_SSO_ROLE_NAME}@\${AWS_SSO_ACCOUNT_NAME}"
-  echo "   New TTL: \$(ttl)"
 }
 
-# Define deactivate function
 deactivate() {
-  unset AWS_ACCESS_KEY_ID
-  unset AWS_SECRET_ACCESS_KEY
-  unset AWS_SESSION_TOKEN
-  unset AWS_SSO_ACCOUNT_NAME
-  unset AWS_SSO_ROLE_NAME
-  unset AWS_SSO_EXPIRATION
-  unset _AWS_SSO_ACCESS_TOKEN
-  unset _AWS_SSO_ACCOUNT_ID
-  unset _AWS_SSO_REGION
-  # Remove precmd hook
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SSO_ACCOUNT_NAME AWS_SSO_ROLE_NAME AWS_SSO_EXPIRATION
+  unset _AWS_SSO_ACCESS_TOKEN _AWS_SSO_REFRESH_TOKEN _AWS_SSO_ACCOUNT_ID _AWS_SSO_CLIENT_ID _AWS_SSO_CLIENT_SECRET
+  rm -f "\${HOME}/.aws/sso-shared-token.json" 2>/dev/null
   precmd_functions=(\${precmd_functions[@]/_aws_sso_precmd})
-  unset -f _aws_sso_precmd
-  unset -f ttl
-  unset -f refresh
-  if [ -n "\${_AWS_SSO_ORIGINAL_PROMPT:-}" ]; then
-    PROMPT="\$_AWS_SSO_ORIGINAL_PROMPT"
-    unset _AWS_SSO_ORIGINAL_PROMPT
-  fi
-  unset -f deactivate
+  unset -f _aws_sso_precmd _ttl ttl _aws_sso_write_shared refresh switch deactivate
+  if [ -n "\${_AWS_SSO_ORIGINAL_PROMPT:-}" ]; then PROMPT="\$_AWS_SSO_ORIGINAL_PROMPT"; unset _AWS_SSO_ORIGINAL_PROMPT; fi
   echo "AWS SSO session deactivated"
 }
 
-echo "\\n✅ Authenticated as ${escaped_role_name} in ${escaped_account_name}"
-echo "   Run 'ttl' for remaining time, 'refresh' to renew credentials, 'deactivate' to clear\\n"
+echo "\\n✅ Authenticated as ${role_name} in ${account_name}"
+echo "   Run 'switch' to change accounts, 'refresh' to renew credentials, 'deactivate' to logout\\n"
 EOF
 }
 
@@ -453,72 +438,85 @@ EOF
 # ============================================================================
 
 main() {
-  # Step 1: Register client
   register_client
+
+  local skip_auth=false
   
-  # Step 2: Start device authorization
-  start_device_authorization
-  
-  status ""
-  status "📋 Opening browser for authentication..."
-  status "   If browser doesn't open, visit: $VERIFICATION_URI_COMPLETE"
-  status "   User code: $USER_CODE"
-  status ""
-  
-  open_url "$VERIFICATION_URI_COMPLETE"
-  
-  # Step 3: Poll for token
-  status "⏳ Waiting for authentication..."
-  poll_for_token
-  status "✓ Authentication successful!"
-  status ""
-  
-  # Step 4: List accounts
-  status "📋 Fetching available accounts..."
-  list_accounts
-  status "   Found ${#ACCOUNT_IDS[@]} accounts"
-  
-  if [[ ${#ACCOUNT_IDS[@]} -eq 0 ]]; then
-    die "No AWS accounts available"
+  if [[ -n "${_AWS_SSO_ACCESS_TOKEN:-}" ]]; then
+     ACCESS_TOKEN="${_AWS_SSO_ACCESS_TOKEN}"
+     REFRESH_TOKEN="${_AWS_SSO_REFRESH_TOKEN:-}"
+     
+     if list_accounts >/dev/null 2>&1; then
+       skip_auth=true
+     elif [[ -n "$REFRESH_TOKEN" ]]; then
+       status "⏳ Session expired. Refreshing using OIDC token..."
+       if try_refresh_oidc_token; then
+          list_accounts
+          skip_auth=true
+       fi
+     fi
+  elif read_shared_tokens; then
+     ACCESS_TOKEN="$SHARED_ACCESS_TOKEN"
+     REFRESH_TOKEN="$SHARED_REFRESH_TOKEN"
+     CLIENT_ID="$SHARED_CLIENT_ID"
+     CLIENT_SECRET="$SHARED_CLIENT_SECRET"
+     _AWS_SSO_CLIENT_ID="$CLIENT_ID"
+     _AWS_SSO_CLIENT_SECRET="$CLIENT_SECRET"
+     
+     log "Found shared tokens from $SHARED_TOKEN_FILE"
+     
+     if list_accounts >/dev/null 2>&1; then
+       skip_auth=true
+       status "♻️  Reusing SSO session from another terminal"
+     elif [[ -n "$REFRESH_TOKEN" ]]; then
+       status "⏳ Shared session expired. Refreshing..."
+       if try_refresh_oidc_token; then
+          list_accounts
+          skip_auth=true
+       fi
+     fi
+  fi
+
+  if [[ "$skip_auth" == "false" ]]; then
+    start_device_authorization
+    status ""; status "📋 Opening browser: $VERIFICATION_URI_COMPLETE"
+    status "   User code: $USER_CODE"; status ""
+    open_url "$VERIFICATION_URI_COMPLETE"
+    
+    status "⏳ Waiting for authentication..."
+    poll_for_token
+    status "✓ Authentication successful!"; status ""
+    
+    status "📋 Fetching available accounts..."
+    list_accounts
   fi
   
-  # Step 5: Account selection
+  if [[ ${#ACCOUNT_IDS[@]} -eq 0 ]]; then die "No AWS accounts available"; fi
+
+  # Account Selection
   local account_choices=()
-  for i in "${!ACCOUNT_IDS[@]}"; do
-    account_choices+=("${ACCOUNT_NAMES[$i]} (${ACCOUNT_IDS[$i]})")
-  done
-  
+  for i in "${!ACCOUNT_IDS[@]}"; do account_choices+=("${ACCOUNT_NAMES[$i]} (${ACCOUNT_IDS[$i]})"); done
   select_option "Select AWS Account:" "${account_choices[@]}"
   local selected_account_id="${ACCOUNT_IDS[$SELECTED_INDEX]}"
   local selected_account_name="${ACCOUNT_NAMES[$SELECTED_INDEX]}"
   
-  # Step 6: List roles
+  # Role Selection
   list_account_roles "$selected_account_id"
+  if [[ ${#ROLE_NAMES[@]} -eq 0 ]]; then die "No roles available"; fi
   
-  if [[ ${#ROLE_NAMES[@]} -eq 0 ]]; then
-    die "No roles available for this account"
-  fi
-  
-  # Step 7: Role selection
   local selected_role_name
   if [[ ${#ROLE_NAMES[@]} -eq 1 ]]; then
     selected_role_name="${ROLE_NAMES[0]}"
-    status ""
-    status "📌 Auto-selecting only available role: $selected_role_name"
+    status "📌 Auto-selecting role: $selected_role_name"
   else
     select_option "Select Role:" "${ROLE_NAMES[@]}"
     selected_role_name="${ROLE_NAMES[$SELECTED_INDEX]}"
   fi
   
-  # Step 8: Get credentials
-  status ""
   status "🔑 Fetching credentials..."
   get_role_credentials "$selected_account_id" "$selected_role_name"
   
-  # Step 9: Output shell commands (to stdout for eval)
   output_shell_commands "$selected_account_name" "$selected_role_name" "$selected_account_id"
 }
 
-# Run main
 main
-
